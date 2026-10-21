@@ -1,0 +1,54 @@
+#!/usr/bin/env bpftrace
+/*
+ * M4 - eBPF syscall latency collector.
+ *
+ * Scoped to the isolab run cgroup so co-located tenants are not traced.
+ * Aggregation happens in kernel space as log2 histograms; nothing is pushed
+ * per-event to userspace, because a ring-buffer round trip costs about a
+ * microsecond and would swamp the effect under study.
+ *
+ * Run:   sudo bpftrace syscall_lat.bt
+ * Stop:  Ctrl-C (histograms print on exit)
+ *
+ * NOTE ON WHAT THIS CAN AND CANNOT SEE
+ * Seccomp filter evaluation happens in syscall_trace_enter() BEFORE the
+ * raw_syscalls:sys_enter tracepoint fires, so the L0-vs-L3 delta will NOT
+ * appear here. Use bench_syscall's userspace timing for seccomp cost and
+ * this script for the in-kernel breakdown. Verify the ordering on your own
+ * kernel with the experiment in the README (Phase 3, step 4).
+ *
+ * bpftrace syntax note: v0.17+ uses args.id; older builds use args->id.
+ * If you get a parse error, swap them.
+ */
+
+BEGIN
+{
+    printf("collector attached, tracing cgroup isolab/run\n");
+}
+
+tracepoint:raw_syscalls:sys_enter
+/cgroup == cgroupid("/sys/fs/cgroup/isolab/run")/
+{
+    @start[tid] = nsecs;
+    @sysid[tid] = args.id;
+}
+
+tracepoint:raw_syscalls:sys_exit
+/@start[tid]/
+{
+    $lat = nsecs - @start[tid];
+    $id = @sysid[tid];
+
+    @lat_ns[$id] = hist($lat);
+    @count[$id]  = count();
+    @total_ns[$id] = sum($lat);
+
+    delete(@start[tid]);
+    delete(@sysid[tid]);
+}
+
+END
+{
+    clear(@start);
+    clear(@sysid);
+}
